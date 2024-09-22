@@ -1,0 +1,396 @@
+---
+title: "EPL Report"
+output: html_document
+date: "2024-09-12"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = F,
+                      warning = F)
+```
+
+```{r}
+rm(list=ls())
+library(tidyverse)
+source("D:/wangxiaoyang/Regular_Work/support_files/get_day_span_program_sheet.R")
+source("D:/wangxiaoyang/Regular_Work/support_files/other_functions.R")
+library(readxl, quietly = TRUE)
+library(jsonlite)
+library(openxlsx)
+
+channel_mapping = read.csv("D:/wangxiaoyang/Regular_Work/support_files/channel_mapping.csv")
+team_mapping = read.xlsx("D:/wangxiaoyang/Regular_Work/support_files/team_mapping_football.xlsx", sheet = "New")
+code_mapping = read_excel("D:/wangxiaoyang/Regular_Work/support_files/team_mapping_football.xlsx", sheet = "Mapping")
+
+sch_seq = read_excel("D:/wangxiaoyang/Regular_Work/Schedule/sch_five_league.xlsx")
+sch_seq = sch_seq %>% 
+  mutate(
+    time_stamp_game_start = convert_tz(Date, Start, hms=F),
+    time_stamp_game_end = time_stamp_game_start + hours(2)
+  )
+
+tar_info = read.csv("D:/wangxiaoyang/Regular_Work/support_files/target_digits.csv")
+tar_info$Target <- lapply(tar_info$Target, fromJSON)
+tar_info$Var_Dig <- lapply(tar_info$Var_Dig, fromJSON)
+```
+
+```{r}
+kk = 3
+league = c("EPL", "Bundesliga", "Ligue 1", "La Liga")[kk]
+league_chn = c("英超", "德甲", "法甲", "西甲")[kk]
+tv_col_start = 10
+target_num = c(21, 21, 1, 21)[kk]
+tv_var_num = c(7, 7, 5, 7)[kk]
+tv_cols = seq(tv_col_start, tv_col_start+tv_var_num*target_num-1)
+contains_pre_day = F
+update_date = as.Date( c("2024-08-27", "2024-09-17") )
+```
+
+# Game: Non CDP
+```{r}
+data_file = file.path(league, "data_game.csv")
+df_org = read.csv(data_file, header = F)
+df_org[2, tv_cols] = paste(df_org[1, tv_cols], df_org[2, tv_cols])
+colnames(df_org) = df_org[2, ]
+df_org = df_org[-1:-2, ]
+
+df = df_org %>% 
+  filter(
+    地区 != 'DUMMY',
+    Title != '摘要'
+  ) %>% 
+  mutate(
+    Regions = str_split_fixed(地区, "\\(", 2)[,1],
+    Regions = paste0(
+      str_sub(地区, 1, 1),
+      tolower(str_sub(Regions, 2, nchar(Regions)))
+    )) %>% 
+  filter(
+    mapply(grepl, Regions, Channel) | 
+      (Regions=="National" & grepl("CCTV", Channel))
+  )
+
+df_2025 = df %>% 
+  filter(
+    grepl("2024/2025|24/25", Title)
+  )
+
+tmp = get_day_spanning(df_2025, tv_cols, contains_pre_day) # Attention
+
+if (length(tmp) == 3) {
+  write.table(tmp$res_txt,
+              file.path(league, 'day_span_ps.txt'),
+              row.names = F,
+              col.names = F,
+              quote = F,
+              fileEncoding = "GBK")
+}
+
+```
+
+## Deal Day Span
+```{r}
+if (length(tmp) == 3) {
+  df_ds = read.csv( file.path(league, "game_day_span.csv") )
+  df_ds[2, tv_cols-6] = paste(df_ds[1, tv_cols-6], df_ds[2, tv_cols-6])
+  colnames(df_ds) = df_ds[2, ]
+  df_ds = df_ds[-1:-2, ]
+  
+  df_ds = df_ds %>% 
+    filter(
+      地区 != 'DUMMY',
+      Title != '摘要'
+    ) %>% 
+    mutate(
+      Regions = str_split_fixed(地区, "\\(", 2)[,1],
+      Regions = paste0(
+        str_sub(地区, 1, 1),
+        tolower(str_sub(Regions, 2, nchar(Regions)))
+      )) %>% 
+    filter(
+      mapply(grepl, Regions, Title) | 
+        (Regions=="National" & grepl("CCTV", Title))
+    ) %>% 
+    select(
+      -地区, -摘要, -Regions
+    )
+  
+  data_ds = tmp[[3]] %>% 
+    mutate(
+      indicator = paste(Date, Channel)
+    ) %>% 
+    left_join(
+      df_ds,
+      join_by(indicator == Title)
+    ) %>% 
+    select(
+      -(tv_cols), # Maybe wrong
+      -indicator
+    )
+  
+  colnames(data_ds) = colnames(tmp[[2]])
+  
+  df_final = rbind(tmp[[2]], data_ds)
+} else {
+  df_final = tmp[[1]]
+}
+```
+
+# Game: CDP
+```{r}
+cdp_ps = read.csv("./cdp_sch.csv")
+
+colnames(cdp_ps) = cdp_ps[1,]
+cdp_ps = cdp_ps[-1, 3:16]
+
+cdp_epl = cdp_ps %>% 
+  filter(
+    筛选 == league_chn,
+    赛季 == '2024-25赛季',
+    as.Date(日期) >= update_date[1],
+    as.Date(日期) <= update_date[2]
+  ) %>% 
+  mutate(
+    tmp1 = str_split_fixed(描述, "\\?", 2)[, 1],
+    tmp2 = str_split_fixed(描述, "\\?", 2)[, 2],
+    Program = if_else( tmp2 == '', 
+                       节目名称,
+                       paste0(节目名称, tmp1)
+    ),
+    Description = if_else( tmp2 == '',
+                           描述,
+                           tmp2),
+    Weekday = "",
+    Regions = "National",
+    结束时间 = if_else(
+      时长 == "1:25:00",
+      convert_time( get_seconds(结束时间) - 5*60, excel = F ), 
+      结束时间
+    ),
+    时长 = if_else(
+      时长 == "1:25:00",
+      "1:20:00",
+      时长
+    )
+  ) %>% 
+  select(Regions, Program, 日期, Weekday,
+         开始时间, 结束时间, 时长, 
+         频道, Program, Description)
+```
+
+```{r}
+tmp_cdp = get_day_spanning(
+  cdp_epl,
+  NULL,
+  F,
+  title = "Program",
+  start = "开始时间",
+  dur = "时长",
+  end = "结束时间",
+  date = "日期",
+  channel = "频道"
+)
+
+if (length(tmp_cdp) == 1) {
+  df_cdp = tmp_cdp[[1]]
+}
+
+df_cdp = df_cdp %>%
+  left_join(channel_mapping, 
+            join_by(Channel == channel)) %>% 
+  mutate(
+    ProgramID = paste(Channel, Date, Start)
+  )
+
+res = with(df_cdp,
+           paste(format(as.Date(Date, format="%Y/%m/%d"), "%Y%m%d"),
+                 gsub(" ", 0, sprintf("%04s", code)),
+                 gsub(" ", 0, gsub(":", "", sprintf("%08s", Start))),
+                 gsub(" ", 0, gsub(":", "", sprintf("%08s", End))),
+                 ProgramID
+           ) )
+```
+
+```{r}
+write.table(res,
+            file.path(league, 'cdp_game_ps.txt'),
+            row.names = F,
+            col.names = F,
+            quote = F,
+            fileEncoding = "GBK")
+```
+
+```{r}
+df_cdp_org = read.csv(file.path(league, "./data_cdp_game.csv"), header = F)
+
+df_cdp_org[2, 8:dim(df_cdp_org)[2]] = paste(df_cdp_org[1, 8:dim(df_cdp_org)[2]], df_cdp_org[2, 8:dim(df_cdp_org)[2]])
+colnames(df_cdp_org) = df_cdp_org[2, ]
+df_cdp_org = df_cdp_org[-1:-2, ]
+colnames(df_cdp_org)[2] = 'ProgramID'
+
+df_cdp_game = df_cdp_org %>% 
+  filter(
+    地区 != 'DUMMY',
+    ProgramID != '摘要'
+  ) %>% 
+  mutate(
+    Regions = str_split_fixed(地区, "\\(", 2)[,1],
+    Regions = paste0(
+      str_sub(地区, 1, 1),
+      tolower(str_sub(Regions, 2, nchar(Regions)))
+    )) %>% 
+  filter(
+    mapply(grepl, Regions, ProgramID) | 
+      (Regions=="National" & grepl("CCTV|Qinghai", ProgramID)) |
+      (Regions=="Fujian" & grepl("FJ", ProgramID))
+  ) %>% 
+  select(
+    -地区
+  )
+
+
+df_cdp_game_final = df_cdp_game %>%
+  left_join(
+    df_cdp %>% select(Title, Description, Dur, ProgramID),
+    join_by(ProgramID)
+  ) %>% 
+  mutate(
+    Start = `Start Time`,
+    End = `End Time`
+  ) %>% 
+  select(
+    Regions, Title, Description, Channel,
+    Date, Weekday, Start, End, Dur,
+    all_of(7:(7+target_num*tv_var_num-1))
+  )
+
+df_cdp_game_final[,7:(7+target_num*tv_var_num-1)][df_cdp_game_final[7:(7+target_num*tv_var_num-1)] == '.'] = 0
+```
+
+```{r}
+df_res = rbind(df_final, df_cdp_game_final)
+```
+
+# Add Info
+```{r}
+df_res = df_res %>% 
+  mutate(
+    Round = str_extract(Title, "(?<=第).+?(?=轮)"),
+    Round = replace_chn_num(Round),
+    Round = sprintf("Round %02d", as.numeric(Round)),
+    Team1 = str_split_fixed(Description, "VS", 2)[,1],
+    Team2 = str_split_fixed(Description, "VS", 2)[,2],
+    Team2 = gsub("\\(直播\\)", "", Team2)
+  ) %>%
+  left_join(team_mapping, by = c("Team1" = "Org")) %>%
+  rename(Home_Team_Code = Team_Code) %>%
+  left_join(team_mapping, by = c("Team2" = "Org")) %>%
+  rename(Away_Team_Code = Team_Code) %>%
+  left_join(code_mapping, by = c("Home_Team_Code" = "Team_Code")) %>%
+  rename(Home_Name = Eng_Name) %>%
+  left_join(code_mapping, by = c("Away_Team_Code" = "Team_Code")) %>%
+  rename(Away_Name = Eng_Name)
+
+```
+
+
+```{r}
+sch_seq_league = sch_seq %>% 
+  filter(
+    League == league
+  )
+
+df_res = df_res %>% 
+  left_join(
+    sch_seq_league,
+    join_by(
+      Home_Name == Home_Team,
+      Away_Name == Away_Team,
+      Round
+    )
+  ) %>% 
+  rename(Start = Start.x,
+         Date = Date.x) %>%
+  mutate(
+    time_stamp_prog_start = convert_tz(Date, Start),
+    time_stamp_prog_end = convert_tz(Date, End),
+    time_stamp_prog_end = if_else(
+      time_stamp_prog_end < time_stamp_prog_start,
+      time_stamp_prog_end + days(1),
+      time_stamp_prog_end
+    ),
+    Air = if_else( (time_stamp_game_start <= time_stamp_prog_end) & 
+                     (time_stamp_game_end >= time_stamp_prog_start), 'Live', 'Non-Live')
+  ) 
+
+df_res = df_res %>% 
+  mutate(
+    Timeslot = if_else(
+      Air == "Live",
+      Live_Timeslot,
+      ""
+    ),
+    Dur_s = sapply(Dur, get_seconds),
+    No = ""
+  )
+```
+
+```{r}
+df_res = df_res %>% 
+  select(
+    Round, Match_in_Season, Dur_s, Dur, Air, Detail, No, Regions,
+    Title, Description, Channel, Date, Weekday, Timeslot,
+    Start, End,
+    all_of(tv_cols)
+  )
+
+time_columns <- c("Start", "End", "Dur")
+
+seconds_in_a_day <- 24 * 3600
+
+for (col in time_columns) {
+  df_res[[col]] <- sapply(df_res[[col]], convert_to_excel_time)
+}
+```
+
+```{r}
+tar_info = tar_info %>% 
+  filter(
+    Other == paste0(league, "-Match")
+  ) %>% 
+  select(Var_Dig)
+tar_info = tar_info[[1]][[1]]
+```
+
+```{r}
+digits = rep(tar_info$Digit, target_num)
+digits
+```
+
+
+```{r}
+dff = df_res %>% 
+  arrange(
+    Channel, Date, Start
+  ) %>% 
+  mutate(
+    Regions = case_when(
+      Regions == "National" ~ "China National",
+      Regions == "Guangdong" ~ "Guangdong Prov.",
+      Regions == "Tianjin" ~ "Tianjin Muni.",
+      .default = Regions
+    )
+  )
+
+
+for (i in 1:length(digits)) {
+  dff[, 17+i-1] = round(as.numeric(dff[,17+i-1]), digits[i])
+}
+dff[is.na(dff)] = 0
+```
+
+```{r}
+write.xlsx(dff, file.path(league, "result11.xlsx"))
+```
+
+
